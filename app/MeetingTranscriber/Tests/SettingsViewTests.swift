@@ -409,6 +409,15 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         XCTAssertNoThrow(try body.find(text: "LLM Provider"))
     }
 
+    func testTranscriptRetentionHintExplainsSuccessfulProtocolRequirement() throws {
+        let body = try makeOutput().inspect()
+        XCTAssertNoThrow(
+            try body.find(
+                text: "To avoid data loss, a raw transcript is removed only after meeting minutes were saved successfully.",
+            ),
+        )
+    }
+
     #if !APPSTORE
         func testClaudeCLIProviderShowsBinaryPicker() throws {
             let settings = makeSettings()
@@ -438,7 +447,9 @@ final class SettingsViewTests: XCTestCase { // swiftlint:disable:this type_body_
         let settings = makeSettings()
         settings.protocolProvider = .none
         let body = try makeOutput(settings: settings).inspect()
-        XCTAssertNoThrow(try body.find(text: "Only the raw transcript will be saved — no LLM summarization."))
+        XCTAssertNoThrow(
+            try body.find(text: "No LLM summarization will be generated. Raw transcripts are retained if no protocol is saved."),
+        )
     }
 
     func testNoneProviderHidesEndpointField() throws {
