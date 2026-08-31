@@ -4,6 +4,14 @@ import os.log
 
 private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "PipelineQueue")
 
+/// Output policy captured when a job enters the queue. Capturing it per job
+/// means a Settings change applies to the next recording without changing the
+/// privacy semantics of a recording that is already being processed.
+struct TranscriptOutputOptions {
+    let includeFullTranscriptInProtocol: Bool
+    let saveRawTranscriptSeparately: Bool
+}
+
 /// Raw diarization output for one run of the diarize loop. `combined` is the
 /// result fed into speaker naming (the prefixed dual-track merge, the app-only
 /// or mic-only single-track fallback, or the single-source result); `app`/`mic`
@@ -18,7 +26,7 @@ struct DiarizationRun {
 
 @MainActor
 @Observable
-// swiftlint:disable:next attributes
+// swiftlint:disable:next attributes type_body_length
 class PipelineQueue {
     /// Internal setter (not `private(set)`) because the stage and recovery
     /// extension methods in sibling files (PipelineQueue+Stages.swift,
@@ -59,6 +67,12 @@ class PipelineQueue {
     let echoDedupEnabled: Bool
     let numSpeakers: Int
     let micLabel: String
+    /// Compatibility policy for snapshots created before a job carried its own
+    /// output options.
+    private let fallbackTranscriptOutputOptions: TranscriptOutputOptions
+    /// Reads the current Settings only when a job is enqueued; the values are
+    /// then copied onto the job and remain stable for its whole lifecycle.
+    private let transcriptOutputOptionsProvider: () -> TranscriptOutputOptions
     let speakerMatcherFactory: () -> SpeakerMatcher
     let vadConfig: VADConfig?
     /// nil disables JSONL logging. AppState injects a real instance for production;
@@ -234,6 +248,12 @@ class PipelineQueue {
         echoDedupEnabled = true
         self.numSpeakers = 0
         self.micLabel = "Me"
+        let outputOptions = TranscriptOutputOptions(
+            includeFullTranscriptInProtocol: true,
+            saveRawTranscriptSeparately: true,
+        )
+        fallbackTranscriptOutputOptions = outputOptions
+        transcriptOutputOptionsProvider = { outputOptions }
         self.speakerMatcherFactory = speakerMatcherFactory
         self.snapshotWriter = snapshotWriter
         self.vadConfig = nil
@@ -310,6 +330,9 @@ class PipelineQueue {
         echoDedupEnabled: Bool = true,
         numSpeakers: Int = 0,
         micLabel: String = "Me",
+        includeFullTranscriptInProtocol: Bool = true,
+        saveRawTranscriptSeparately: Bool = true,
+        transcriptOutputOptionsProvider: (() -> TranscriptOutputOptions)? = nil,
         speakerMatcherFactory: @escaping () -> SpeakerMatcher = PipelineQueue.throwawayMatcherFactory(),
         snapshotWriter: @escaping @Sendable ([PipelineJob], URL) throws -> Void = PipelineSnapshot.save,
         vadConfig: VADConfig? = nil,
@@ -341,6 +364,12 @@ class PipelineQueue {
         // of micLabel for both the tagging and the re-split, so sanitizing here
         // keeps them consistent.)
         self.micLabel = micLabel == DiarizationProcess.remoteSpeakerLabel ? "Me" : micLabel
+        let outputOptions = TranscriptOutputOptions(
+            includeFullTranscriptInProtocol: includeFullTranscriptInProtocol,
+            saveRawTranscriptSeparately: saveRawTranscriptSeparately,
+        )
+        fallbackTranscriptOutputOptions = outputOptions
+        self.transcriptOutputOptionsProvider = transcriptOutputOptionsProvider ?? { outputOptions }
         self.speakerMatcherFactory = speakerMatcherFactory
         self.snapshotWriter = snapshotWriter
         self.vadConfig = vadConfig
@@ -375,12 +404,42 @@ class PipelineQueue {
         jobs.filter { $0.state == .done }
     }
 
-    func enqueue(_ job: PipelineJob) {
+    func enqueue(_ inputJob: PipelineJob) {
+        var job = inputJob
+        stampTranscriptOutputOptions(on: &job)
         jobs.append(job)
         eventLog.append(jobID: job.id, event: "enqueued", from: nil, to: job.state)
         saveSnapshot()
         logger.info("Enqueued job: \(job.meetingTitle, privacy: .private) (\(job.id))")
         triggerProcessing()
+    }
+
+    /// Resolves the output policy for an existing job. The fallback keeps
+    /// snapshots from versions before per-job settings compatible.
+    /// Internal because pipeline stages in sibling files use it.
+    func transcriptOutputOptions(forJobID jobID: UUID) -> TranscriptOutputOptions {
+        guard let job = jobs.first(where: { $0.id == jobID }) else {
+            return fallbackTranscriptOutputOptions
+        }
+        return TranscriptOutputOptions(
+            includeFullTranscriptInProtocol: job.includeFullTranscriptInProtocol
+                ?? fallbackTranscriptOutputOptions.includeFullTranscriptInProtocol,
+            saveRawTranscriptSeparately: job.saveRawTranscriptSeparately
+                ?? fallbackTranscriptOutputOptions.saveRawTranscriptSeparately,
+        )
+    }
+
+    /// Copy the current settings onto a newly admitted job. Recovery uses the
+    /// same admission rule as regular enqueueing so a later settings change
+    /// cannot change output handling for an already recovered recording.
+    func stampTranscriptOutputOptions(on job: inout PipelineJob) {
+        let outputOptions = transcriptOutputOptionsProvider()
+        if job.includeFullTranscriptInProtocol == nil {
+            job.includeFullTranscriptInProtocol = outputOptions.includeFullTranscriptInProtocol
+        }
+        if job.saveRawTranscriptSeparately == nil {
+            job.saveRawTranscriptSeparately = outputOptions.saveRawTranscriptSeparately
+        }
     }
 
     /// Test-only: insert a fully-formed job at any state, bypassing
@@ -483,6 +542,16 @@ class PipelineQueue {
         guard oldState != newState || error != nil else { return }
         jobs[index].state = newState
         if let error { jobs[index].error = error }
+        if newState == .done {
+            removeRawTranscriptArtifactsIfSafe(for: index)
+        } else if newState == .error,
+                  !transcriptOutputOptions(forJobID: id).saveRawTranscriptSeparately,
+                  jobs[index].transcriptPath != nil {
+            let warning = "Raw transcript retained because the job did not complete"
+            if !jobs[index].warnings.contains(warning) {
+                jobs[index].warnings.append(warning)
+            }
+        }
         recordStageTransition(from: oldState, to: newState, jobID: id)
         eventLog.append(jobID: id, event: "state_change", from: oldState, to: newState)
         saveSnapshot()
@@ -505,6 +574,59 @@ class PipelineQueue {
     /// it from the in-memory list. No-op when no store is wired.
     private func recordTerminalJob(_ job: PipelineJob) {
         terminalJobStore?.record(JobStatusDTO(job: job))
+    }
+
+    /// Deletes raw transcript artifacts only after a successfully completed job
+    /// has saved a protocol. A failed or disabled protocol generator leaves the
+    /// transcript intact so users can recover the meeting content instead of
+    /// losing it with no generated minutes to show for it.
+    private func removeRawTranscriptArtifactsIfSafe(for index: Int) {
+        guard !transcriptOutputOptions(forJobID: jobs[index].id).saveRawTranscriptSeparately else { return }
+        guard jobs[index].protocolPath != nil else {
+            if jobs[index].transcriptPath != nil {
+                let warning = "Raw transcript retained because no protocol was saved"
+                if !jobs[index].warnings.contains(warning) {
+                    jobs[index].warnings.append(warning)
+                }
+            }
+            return
+        }
+
+        let transcriptPath = jobs[index].transcriptPath
+        let slug = jobs[index].namingSlug
+        let isAccessingOutputDir = outputDir?.startAccessingSecurityScopedResource() ?? false
+        defer {
+            if isAccessingOutputDir {
+                outputDir?.stopAccessingSecurityScopedResource()
+            }
+        }
+        if let transcriptPath {
+            do {
+                try FileManager.default.removeItem(at: transcriptPath)
+                logger.info("Transcript removed according to output setting")
+                jobs[index].transcriptPath = nil
+            } catch CocoaError.fileNoSuchFile {
+                // A failed or interrupted write may leave only the path; the
+                // desired final state is still no raw transcript.
+                jobs[index].transcriptPath = nil
+            } catch {
+                logger.warning(
+                    "Failed to remove transcript according to output setting: \(error.localizedDescription, privacy: .public)",
+                )
+                jobs[index].warnings.append("Raw transcript could not be removed")
+            }
+        }
+        do {
+            try naming.removeTranscriptSegments(slug: slug)
+        } catch {
+            logger.warning(
+                "Failed to remove transcript segments according to output setting: \(error.localizedDescription, privacy: .public)",
+            )
+            let warning = "Raw transcript segments could not be removed"
+            if !jobs[index].warnings.contains(warning) {
+                jobs[index].warnings.append(warning)
+            }
+        }
     }
 
     func addWarning(id: UUID, _ message: String) {

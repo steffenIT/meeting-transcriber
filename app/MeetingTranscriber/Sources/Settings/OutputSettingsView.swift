@@ -78,6 +78,14 @@ struct OutputSettingsView: View {
             .accessibilityIdentifier(A11yID.outputFolderSection)
 
             Section("Protocol Generation") {
+                Toggle("Include full transcript in protocol", isOn: $settings.includeFullTranscriptInProtocol)
+                    .accessibilityIdentifier(A11yID.includeFullTranscriptToggle)
+                Toggle("Save raw transcript separately", isOn: $settings.saveRawTranscriptSeparately)
+                    .accessibilityIdentifier(A11yID.saveRawTranscriptToggle)
+                Text("To avoid data loss, a raw transcript is removed only after meeting minutes were saved successfully.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Picker("LLM Provider", selection: $settings.protocolProvider) {
                     ForEach(ProtocolProvider.allCases, id: \.self) { provider in
                         Text(provider.label).tag(provider)
@@ -125,7 +133,7 @@ struct OutputSettingsView: View {
             openAIConfigView
 
         case .none:
-            Text("Only the raw transcript will be saved — no LLM summarization.")
+            Text("No LLM summarization will be generated. Raw transcripts are retained if no protocol is saved.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
